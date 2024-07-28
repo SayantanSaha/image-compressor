@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"image"
@@ -21,7 +22,6 @@ import (
 )
 
 const maxPixels = 12000000 // 12 Megapixels
-const numThreads = 10      // Number of threads
 const batchSize = 200      // Number of files to process in each batch
 
 func humanReadableSize(size int64) string {
@@ -93,7 +93,7 @@ func addWatermark(img image.Image, text string, fontPath string) (image.Image, e
 	c := freetype.NewContext()
 	c.SetDPI(72)
 	c.SetFont(fnt)
-	c.SetFontSize(60)
+	c.SetFontSize(20)
 	c.SetClip(rgba.Bounds())
 	c.SetDst(rgba)
 	c.SetSrc(image.Black)
@@ -136,10 +136,12 @@ func compressImage(inputPath, outputPath string, maxPixels int, watermarkText, f
 		newImg = img
 	}
 
-	// Add watermark
-	newImg, err = addWatermark(newImg, watermarkText, fontPath)
-	if err != nil {
-		return fmt.Errorf("failed to add watermark: %v", err)
+	if watermarkText != "" {
+		// Add watermark
+		newImg, err = addWatermark(newImg, watermarkText, fontPath)
+		if err != nil {
+			return fmt.Errorf("failed to add watermark: %v", err)
+		}
 	}
 
 	outFile, err := os.Create(outputPath)
@@ -183,7 +185,6 @@ func compressImages(threadID int, files []string, outputDir, watermarkText, font
 			if info, err := os.Stat(path); err == nil {
 				if !info.IsDir() && (strings.HasSuffix(strings.ToLower(info.Name()), ".jpg") || strings.HasSuffix(strings.ToLower(info.Name()), ".png")) {
 					outputFile := filepath.Join(outputDir, strings.TrimSuffix(info.Name(), filepath.Ext(info.Name()))+"_compressed"+filepath.Ext(info.Name()))
-					// fmt.Printf("Thread %d compressing file %s to %s\n", threadID, path, outputFile)
 					if err := compressImage(path, outputFile, maxPixels, watermarkText, fontPath); err == nil {
 						bar.Add(1)
 					} else {
@@ -199,17 +200,38 @@ func compressImages(threadID int, files []string, outputDir, watermarkText, font
 	fmt.Printf("Thread %d finished compressing %d images.\n", threadID, len(files))
 }
 
+func getConfirmation() bool {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Print("Do you want to proceed? (Y/N): ")
+	ch := make(chan string, 1)
+	go func() {
+		text, _ := reader.ReadString('\n')
+		ch <- strings.TrimSpace(strings.ToLower(text))
+	}()
+
+	select {
+	case res := <-ch:
+		return res == "y"
+	case <-time.After(10 * time.Second):
+		fmt.Println("\nNo input received, defaulting to 'No'")
+		return false
+	}
+}
+
 func main() {
-	var maxPixels int
+	var maxPixels, numThreads int
 	var outputDir, watermarkText, fontPath string
+	var skipConfirmation bool
 	flag.IntVar(&maxPixels, "s", 12000000, "maximum number of pixels for the resized image")
+	flag.IntVar(&numThreads, "t", 10, "number of threads")
 	flag.StringVar(&outputDir, "d", "", "directory to save compressed images")
-	flag.StringVar(&watermarkText, "w", "PSRB", "watermark text")
+	flag.StringVar(&watermarkText, "w", "", "watermark text")
 	flag.StringVar(&fontPath, "f", "InkType.ttf", "path to the font file")
+	flag.BoolVar(&skipConfirmation, "y", false, "skip confirmation")
 	flag.Parse()
 
 	if len(flag.Args()) < 1 {
-		fmt.Println("Usage: image-compressor -s <maxPixels> -d <outputDir> -w <watermarkText> -f <fontPath> <path>")
+		fmt.Println("Usage: image-compressor -s <maxPixels> -t <numThreads> -d <outputDir> -w <watermarkText> -f <fontPath> -y <path>")
 		return
 	}
 
@@ -252,6 +274,14 @@ func main() {
 	// Estimate time required (assuming each file takes 0.5 seconds to compress)
 	estimatedTime := time.Duration(totalFiles) * 500 * time.Millisecond
 	fmt.Printf("Estimated time required: %v\n", estimatedTime)
+
+	// Ask for confirmation if the -y flag is not provided
+	if !skipConfirmation {
+		if !getConfirmation() {
+			fmt.Println("Operation cancelled.")
+			return
+		}
+	}
 
 	// Start the compression and measure the actual time taken
 	startTime := time.Now()
