@@ -54,13 +54,13 @@ func calculateTotalSizeAndCount(folderPath, outputFolder string) (int, int64, []
 			return err
 		}
 
-		if info.IsDir() && (filepath.Base(path) == "compressed_files" || path == outputFolder) {
+		if info.IsDir() && (filepath.Base(path) == "compressed_files" || filepath.Base(path) == "processed_files" || path == outputFolder) {
 			return filepath.SkipDir
 		}
 
 		if !info.IsDir() && (strings.HasSuffix(strings.ToLower(info.Name()), ".jpg") || strings.HasSuffix(strings.ToLower(info.Name()), ".png")) {
 			compressedFilePath := filepath.Join(outputFolder, strings.TrimPrefix(path, folderPath))
-			compressedFilePath = filepath.Join(filepath.Dir(compressedFilePath), info.Name())
+			compressedFilePath = strings.TrimSuffix(compressedFilePath, filepath.Ext(compressedFilePath)) + "_compressed" + filepath.Ext(compressedFilePath)
 			if _, err := os.Stat(compressedFilePath); os.IsNotExist(err) {
 				totalFiles++
 				totalSize += info.Size()
@@ -177,10 +177,19 @@ func compressImage(inputPath, outputPath string, maxPixels int, watermarkText, f
 	return nil
 }
 
-func compressImages(threadID int, files []string, outputDir, inputDir, watermarkText, fontPath string, maxPixels int, bar *progressbar.ProgressBar, failedFiles *[]string, mu *sync.Mutex) (int64, error) {
+func moveOriginalFile(filePath, processedFolder, inputDir string) error {
+	relativePath := strings.TrimPrefix(filePath, inputDir)
+	newFilePath := filepath.Join(processedFolder, relativePath)
+
+	// Create the necessary directories
+	os.MkdirAll(filepath.Dir(newFilePath), os.ModePerm)
+
+	return os.Rename(filePath, newFilePath)
+}
+
+func compressImages(threadID int, files []string, outputDir, inputDir, processedFolder, watermarkText, fontPath string, maxPixels int, bar *progressbar.ProgressBar) {
 	fmt.Printf("Thread %d starting to compress %d images.\n", threadID, len(files))
 
-	var compressedTotalSize int64
 	filesPerBatch := batchSize
 	if len(files) < batchSize {
 		filesPerBatch = len(files)
@@ -198,33 +207,27 @@ func compressImages(threadID int, files []string, outputDir, inputDir, watermark
 				if !info.IsDir() && (strings.HasSuffix(strings.ToLower(info.Name()), ".jpg") || strings.HasSuffix(strings.ToLower(info.Name()), ".png")) {
 					relativePath := strings.TrimPrefix(path, inputDir)
 					outputFile := filepath.Join(outputDir, relativePath)
+					outputFile = strings.TrimSuffix(outputFile, filepath.Ext(outputFile)) + "_compressed" + filepath.Ext(outputFile)
 
 					// Create the necessary directories
 					os.MkdirAll(filepath.Dir(outputFile), os.ModePerm)
 
 					if err := compressImage(path, outputFile, maxPixels, watermarkText, fontPath); err == nil {
 						bar.Add(1)
-						if info, err := os.Stat(outputFile); err == nil {
-							compressedTotalSize += info.Size()
+						if err := moveOriginalFile(path, processedFolder, inputDir); err != nil {
+							fmt.Printf("Thread %d failed to move file %s: %v\n", threadID, path, err)
 						}
 					} else {
 						fmt.Printf("Thread %d failed to compress file %s: %v\n", threadID, path, err)
-						mu.Lock()
-						*failedFiles = append(*failedFiles, relativePath)
-						mu.Unlock()
 					}
 				}
 			} else {
 				fmt.Printf("Thread %d failed to stat file %s: %v\n", threadID, path, err)
-				mu.Lock()
-				*failedFiles = append(*failedFiles, strings.TrimPrefix(path, inputDir))
-				mu.Unlock()
 			}
 		}
 	}
 
 	fmt.Printf("Thread %d finished compressing %d images.\n", threadID, len(files))
-	return compressedTotalSize, nil
 }
 
 func getConfirmation() bool {
@@ -243,35 +246,6 @@ func getConfirmation() bool {
 		fmt.Println("\nNo input received, defaulting to 'No'")
 		return false
 	}
-}
-
-func writeReport(reportFile string, startTime time.Time, maxPixels, numThreads int, outputDir, watermarkText, fontPath string, skipConfirmation bool, totalFiles int, totalSize, compressedSize int64, endTime time.Time, failedFiles []string) error {
-	file, err := os.Create(reportFile)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	writer := bufio.NewWriter(file)
-	fmt.Fprintf(writer, "Start Time: %s\n", startTime.Format(time.RFC1123))
-	fmt.Fprintf(writer, "Max Pixels: %d\n", maxPixels)
-	fmt.Fprintf(writer, "Number of Threads: %d\n", numThreads)
-	fmt.Fprintf(writer, "Output Directory: %s\n", outputDir)
-	fmt.Fprintf(writer, "Watermark Text: %s\n", watermarkText)
-	fmt.Fprintf(writer, "Font Path: %s\n", fontPath)
-	fmt.Fprintf(writer, "Skip Confirmation: %v\n", skipConfirmation)
-	fmt.Fprintf(writer, "Total Files: %d\n", totalFiles)
-	fmt.Fprintf(writer, "Total Size Before Compression: %s\n", humanReadableSize(totalSize))
-	fmt.Fprintf(writer, "Total Size After Compression: %s\n", humanReadableSize(compressedSize))
-	fmt.Fprintf(writer, "End Time: %s\n", endTime.Format(time.RFC1123))
-	fmt.Fprintf(writer, "Total Time Taken: %s\n", endTime.Sub(startTime))
-	fmt.Fprintf(writer, "Failed Files Count: %d\n", len(failedFiles))
-	fmt.Fprintf(writer, "Failed Files:\n")
-	for _, file := range failedFiles {
-		fmt.Fprintf(writer, "%s\n", file)
-	}
-
-	return writer.Flush()
 }
 
 func main() {
@@ -303,9 +277,15 @@ func main() {
 	}
 
 	compressedFolder := filepath.Join(outputDir, "compressed_files")
+	processedFolder := filepath.Join(outputDir, "processed_files")
 	err = os.MkdirAll(compressedFolder, 0755)
 	if err != nil {
 		fmt.Printf("Failed to create compressed_files folder: %v\n", err)
+		return
+	}
+	err = os.MkdirAll(processedFolder, 0755)
+	if err != nil {
+		fmt.Printf("Failed to create processed_files folder: %v\n", err)
 		return
 	}
 
@@ -350,9 +330,6 @@ func main() {
 
 	// Divide files among threads
 	var wg sync.WaitGroup
-	var compressedTotalSize int64
-	var failedFiles []string
-	var mu sync.Mutex
 	chunkSize := (len(filePaths) + numThreads - 1) / numThreads
 	for i := 0; i < numThreads; i++ {
 		start := i * chunkSize
@@ -364,22 +341,18 @@ func main() {
 			wg.Add(1)
 			go func(threadID int, files []string, bar *progressbar.ProgressBar) {
 				defer wg.Done()
-				size, _ := compressImages(threadID, files, compressedFolder, inputPath, watermarkText, fontPath, maxPixels, bar, &failedFiles, &mu)
-				mu.Lock()
-				compressedTotalSize += size
-				mu.Unlock()
+				compressImages(threadID, files, compressedFolder, inputPath, processedFolder, watermarkText, fontPath, maxPixels, bar)
 			}(i+1, filePaths[start:end], bars[i])
 		}
 	}
 
 	wg.Wait()
 
-	endTime := time.Now()
-	actualTimeTaken := endTime.Sub(startTime)
+	actualTimeTaken := time.Since(startTime)
 	fmt.Printf("\nActual time taken: %v\n", actualTimeTaken)
 
-	if err := writeReport(filepath.Join(compressedFolder, "report.txt"), startTime, maxPixels, numThreads, outputDir, watermarkText, fontPath, skipConfirmation, totalFiles, totalSize, compressedTotalSize, endTime, failedFiles); err != nil {
-		fmt.Printf("Error writing report: %v\n", err)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
 	} else {
 		fmt.Println("Compression completed successfully")
 	}
